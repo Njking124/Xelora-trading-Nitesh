@@ -710,6 +710,105 @@ def execute_trade(decision: TradingDecision, portfolio: dict, current_price: flo
     
     return None
 
+def fix_trade_data(trades: list) -> list:
+    """Normalize trade records and fill missing P&L fields.
+
+    The simulator can produce BUY records with costs and SELL records with
+    proceeds/profit. This helper keeps the original list untouched, coerces
+    numeric fields once, and uses a stack of open BUY trades so matching SELL
+    rows is linear-time instead of repeatedly scanning previous rows.
+    """
+    if not trades:
+        return []
+
+    def to_float(value: Any, default: float = 0.0) -> float:
+        """Convert numbers or display strings like '$1,234.50' into floats."""
+        if value is None:
+            return default
+        try:
+            if pd.isna(value):
+                return default
+        except (TypeError, ValueError):
+            pass
+        if isinstance(value, (int, float, np.integer, np.floating)):
+            return float(value)
+        if isinstance(value, str):
+            cleaned = value.strip().replace("$", "").replace(",", "").replace("%", "")
+            if not cleaned:
+                return default
+            try:
+                return float(cleaned)
+            except ValueError:
+                return default
+        return default
+
+    fixed_trades = []
+    open_buys = []
+
+    for raw_trade in trades:
+        if not isinstance(raw_trade, dict):
+            continue
+
+        # Copy each trade so callers do not get surprising in-place changes.
+        trade = raw_trade.copy()
+        raw_action = trade.get("action", "")
+        action = str(getattr(raw_action, "value", raw_action)).upper()
+        trade["action"] = action
+
+        # Normalize common numeric fields before deriving missing values.
+        for field in ("price", "shares", "cost", "proceeds", "fees", "profit", "profit_pct", "confidence"):
+            if field in trade:
+                trade[field] = to_float(trade.get(field))
+
+        price = to_float(trade.get("price"))
+        shares = to_float(trade.get("shares"))
+
+        if action == "BUY":
+            cost = to_float(trade.get("cost"), price * shares)
+            if cost == 0 and price and shares:
+                cost = price * shares
+            trade["cost"] = cost
+            trade.setdefault("profit", 0.0)
+            trade["profit_pct"] = 0.0
+
+            # Store the index and investment amount for the next matching SELL.
+            open_buys.append({"index": len(fixed_trades), "cost": cost})
+
+        elif action == "SELL":
+            proceeds = to_float(trade.get("proceeds"), price * shares)
+            if proceeds == 0 and price and shares:
+                proceeds = price * shares
+            trade["proceeds"] = proceeds
+
+            matched_buy = open_buys.pop() if open_buys else None
+            investment = matched_buy["cost"] if matched_buy else 0.0
+
+            # If profit is absent, derive it from the matched BUY investment.
+            profit = to_float(trade.get("profit"))
+            if "profit" not in trade and investment:
+                profit = proceeds - investment
+            trade["profit"] = profit
+
+            existing_profit_pct = to_float(trade.get("profit_pct"))
+            profit_pct = (
+                (profit / investment * 100)
+                if investment and abs(profit) >= 0.01
+                else existing_profit_pct
+            )
+            trade["profit_pct"] = profit_pct
+
+            # Mirror the realized P&L percentage on the corresponding BUY row.
+            if matched_buy:
+                fixed_trades[matched_buy["index"]]["profit_pct"] = profit_pct
+
+        else:
+            trade.setdefault("profit", 0.0)
+            trade.setdefault("profit_pct", 0.0)
+
+        fixed_trades.append(trade)
+
+    return fixed_trades
+
 def display_simulation_results(summary: dict, df: pd.DataFrame, decisions_log: list, symbol: str = None, show_reasoning: bool = True):
     """Display comprehensive simulation results with enhanced UI and trend recommendations"""
     
@@ -1511,7 +1610,7 @@ def display_simulation_results(summary: dict, df: pd.DataFrame, decisions_log: l
     # Enhanced Trade Log with P&L and P&L% and Sentiment Analysis
     if summary['trades']:
         st.subheader("📋 Trade History with P&L Analysis & Sentiment Context")
-        trades_df = pd.DataFrame(summary['trades'])
+        trades_df = pd.DataFrame(fix_trade_data(summary['trades']))
         
         # Add sentiment information to trades
         sentiment_data = []
